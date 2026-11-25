@@ -717,7 +717,7 @@ async fn archive_flake(
             .find_map(|param| param.strip_prefix("dir="))
     });
     Ok(match dir {
-        Some(dir) => format!("path:{path}?dir={dir}"),
+        Some(dir) => format!("path:{path}/{dir}"),
         None => format!("path:{path}"),
     })
 }
