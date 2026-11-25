@@ -14,7 +14,7 @@
 
 { pkgs }:
 let
-  transformDeploy = import ../transform-deploy.nix;
+  transformDeploy = import ../transform-deploy.nix null;
 
   # A real, cheap derivation to stand in for what `activate.nixos cfg` returns.
   fakeProfile = pkgs.runCommand "fake-deploy-rs-profile" { } "touch $out";
@@ -39,6 +39,19 @@ let
     };
   };
 
+  remoteDeploy = {
+    remoteEval = true;
+    nodes.inherit-deploy.profiles.system.path = throw "must not evaluate";
+    nodes.override = {
+      remoteEval = false;
+      profiles.local = { remoteEval = null; path = fakeProfile; };
+      profiles.remote = { remoteEval = true; path = throw "must not evaluate"; };
+    };
+  };
+  remoteOut = transformDeploy remoteDeploy;
+  cliRemote = import ../transform-deploy.nix true;
+  cliLocal = import ../transform-deploy.nix false;
+
   drvOut = transformDeploy derivationDeploy;
   strOut = transformDeploy stringDeploy;
 
@@ -55,5 +68,11 @@ assert drvOut.nodes.demo.hostname == "demo.example";
 # A string-typed path is left untouched, and no drvPath is synthesised.
 assert strProfile.path == "/nix/store/0000000000000000000000000000000000-handwritten";
 assert !(strProfile ? drvPath);
+
+assert !(remoteOut.nodes.inherit-deploy.profiles.system ? path);
+assert remoteOut.nodes.override.profiles.local.path == fakeProfile.outPath;
+assert !(remoteOut.nodes.override.profiles.remote ? path);
+assert !((cliRemote remoteDeploy).nodes.override.profiles.local ? path);
+assert (cliLocal (derivationDeploy // { remoteEval = true; })).nodes.demo.profiles.system.path == fakeProfile.outPath;
 
 pkgs.runCommand "transform-deploy-test" { } "touch $out"

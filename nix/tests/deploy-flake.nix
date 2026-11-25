@@ -67,6 +67,14 @@
           in deploy-rs.lib.${system}.activate.custom activateProfile "$PROFILE/bin/activate";
         };
       };
+      remote-eval = self.deploy.nodes.profile // {
+        remoteEval = true;
+        magicRollback = true;
+        profiles."hello-world".path =
+          assert builtins.pathExists /etc/deploy-rs-remote-eval
+            || throw "the profile must be evaluated on the target";
+          self.deploy.nodes.profile.profiles."hello-world".path;
+      };
       failing-server = {
         hostname = "server";
         sshUser = "root";

@@ -7,11 +7,13 @@ use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
+use tokio::sync::{Mutex, OnceCell};
 use tokio_stream::wrappers::LinesStream;
 use tokio_stream::StreamExt;
 
@@ -32,6 +34,24 @@ pub enum ShowDerivationError {
 impl command::HasCommandError for ShowDerivationError {
     fn title() -> String {
         "Nix show derivation".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum FlakeMetadataError {}
+
+impl command::HasCommandError for FlakeMetadataError {
+    fn title() -> String {
+        "Nix flake metadata".to_string()
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ArchiveError {}
+
+impl command::HasCommandError for ArchiveError {
+    fn title() -> String {
+        "Nix flake archive".to_string()
     }
 }
 
@@ -73,6 +93,18 @@ impl command::HasCommandError for PathInfoError {
 
 #[derive(Error, Debug)]
 pub enum PushProfileError {
+    #[error("remoteEval requires flakes and cannot be used with --file")]
+    RemoteEvalRequiresFlakes,
+    #[error("remoteEval requires a remote build, but remoteBuild is false")]
+    RemoteEvalWithLocalBuild,
+    #[error("Profile is missing path and remoteEval is disabled")]
+    MissingProfilePath,
+    #[error("{0}")]
+    Archive(#[from] command::CommandError<ArchiveError>),
+    #[error("{0}")]
+    FlakeMetadata(#[from] command::CommandError<FlakeMetadataError>),
+    #[error("Invalid JSON while preparing the flake archive: {0}")]
+    ArchiveJson(#[from] serde_json::Error),
     #[error("{0}")]
     ShowDerivation(#[from] command::CommandError<ShowDerivationError>),
     #[error("{0}")]
@@ -531,86 +563,253 @@ pub async fn build_profile_remotely(
         a => return Err(PushProfileError::CopyExit(a)),
     };
 
-    let build_output = {
-        let mut build_command = Command::new("nix");
-        build_command
-            .arg("build")
-            .arg(derivation_name)
-            .arg("--eval-store")
-            .arg("auto")
-            .arg("--store")
-            .arg(&store_address)
-            .arg("--print-out-paths")
-            .args(data.extra_build_args.clone())
-            .env("NIX_SSHOPTS", ssh_opts_str.clone());
+    let mut build_command = Command::new("nix");
+    build_command
+        .arg("build")
+        .arg(derivation_name)
+        .arg("--eval-store")
+        .arg("auto")
+        .arg("--store")
+        .arg(&store_address)
+        .arg("--print-out-paths")
+        .args(&data.extra_build_args)
+        .env("NIX_SSHOPTS", ssh_opts_str);
+    if data.deploy_data.progressbar.is_some() {
+        build_command.args(["--log-format", "internal-json"]);
+    }
+    run_remote_build(build_command, data.deploy_data.progressbar.as_ref()).await
+}
 
-        if let Some(pb) = &data.deploy_data.progressbar {
-            // Concurrent deploy: route nix's output through the spinner.
-            build_command.arg("--log-format").arg("internal-json");
-            debug!("build command: {:?}", build_command);
-            let mut child = build_command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("failed to spawn nix build command");
-
-            // The realised store path arrives on stdout as a plain line,
-            // while only stderr carries the `@nix ...` progress events, so
-            // read stdout ourselves while the spinner consumes stderr.
-            let mut stdout = child.stdout.take().expect("stdout was piped");
-            let stdout_task = tokio::spawn(async move {
-                let mut buf = Vec::new();
-                tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut buf)
-                    .await
-                    .map(|_| buf)
-            });
-
-            update_pb_with_child_output(pb, &mut child).await;
-
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
-            let stdout = stdout_task
-                .await
-                .map_err(|e| {
-                    PushProfileError::Build(command::CommandError::RunError(std::io::Error::other(
-                        e,
-                    )))
-                })?
-                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
-
-            std::process::Output {
-                status,
-                stdout,
-                stderr: Vec::new(),
-            }
+async fn run_remote_build(
+    mut command: Command,
+    progressbar: Option<&ProgressBar>,
+) -> Result<String, PushProfileError> {
+    debug!("build command: {:?}", command);
+    command
+        .stdout(Stdio::piped())
+        .stderr(if progressbar.is_some() {
+            Stdio::piped()
         } else {
-            // No progress bar: let nix write its native output to the terminal.
-            debug!("build command: {:?}", build_command);
-            let child = build_command
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?;
-            child
-                .wait_with_output()
-                .await
-                .map_err(|e| PushProfileError::Build(command::CommandError::RunError(e)))?
+            Stdio::inherit()
+        });
+    let mut child = command
+        .spawn()
+        .map_err(command::CommandError::<BuildError>::RunError)?;
+    if let Some(pb) = progressbar {
+        let mut stdout = child.stdout.take().expect("stdout was piped");
+        let mut output = Vec::new();
+        let (_, read_result) = tokio::join!(
+            update_pb_with_child_output(pb, &mut child),
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout, &mut output),
+        );
+        read_result.map_err(command::CommandError::<BuildError>::RunError)?;
+        let status = child
+            .wait()
+            .await
+            .map_err(command::CommandError::<BuildError>::RunError)?;
+        if !status.success() {
+            return Err(PushProfileError::BuildExit(status.code()));
         }
-    };
+        parse_build_out_path(&output)
+    } else {
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(command::CommandError::<BuildError>::RunError)?;
+        if !output.status.success() {
+            return Err(PushProfileError::BuildExit(output.status.code()));
+        }
+        parse_build_out_path(&output.stdout)
+    }
+}
 
-    match build_output.status.code() {
-        Some(0) => (),
-        a => return Err(PushProfileError::BuildExit(a)),
-    };
+type ArchiveKey = (String, Vec<String>, String);
+type ArchivePaths = HashMap<ArchiveKey, Arc<OnceCell<String>>>;
 
-    parse_build_out_path(&build_output.stdout)
+#[derive(Clone, Default)]
+pub(crate) struct ArchivedFlakes(Arc<Mutex<ArchivePaths>>);
+
+fn is_local_flake(repo: &str) -> bool {
+    match repo.split_once(':') {
+        None => true,
+        Some(("path" | "file" | "git+file" | "tarball+file", _)) => true,
+        Some((prefix, _)) => prefix.contains('/'),
+    }
+}
+
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+pub(crate) fn profile_installable(repo: &str, node: &str, profile: &str) -> String {
+    // Nix's installable selector treats quoted components as literal text.
+    format!("{repo}#deploy.nodes.\"{node}\".profiles.\"{profile}\".path")
+}
+
+fn remote_eval_command(
+    destination: &str,
+    ssh_opts: &[String],
+    installable: &str,
+    extra_args: &[String],
+    progress: bool,
+) -> Command {
+    let mut args = vec!["nix", "build", "--no-link", "--print-out-paths"];
+    if progress {
+        args.extend(["--log-format", "internal-json"]);
+    }
+    args.push(installable);
+    args.extend(extra_args.iter().map(String::as_str));
+    let remote_command = args
+        .into_iter()
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut ssh = Command::new("ssh");
+    ssh.args(ssh_opts)
+        .arg("--")
+        .arg(destination)
+        .arg(remote_command);
+    ssh
+}
+
+#[derive(serde::Deserialize)]
+struct FlakeMetadata {
+    url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ArchivedFlake {
+    path: String,
+}
+
+async fn archive_flake(
+    repo: &str,
+    destination: &str,
+    ssh_opts: &[String],
+    extra_args: &[String],
+) -> Result<String, PushProfileError> {
+    // Nix may resolve a filesystem path to a Git flake in a subdirectory.
+    // The archive JSON reports the Git source root, so preserve Nix's dir parameter.
+    let mut metadata = Command::new("nix");
+    metadata
+        .args(["flake", "metadata", "--json"])
+        .args(extra_args)
+        .args(["--", repo]);
+    let metadata = command::Command::new(metadata)
+        .run::<FlakeMetadataError>()
+        .await?;
+    let FlakeMetadata { url } = serde_json::from_slice(&metadata.stdout)?;
+
+    let mut archive = Command::new("nix");
+    archive
+        .args(["flake", "archive", "--json", "--to"])
+        .arg(format!("ssh-ng://{destination}"))
+        .args(extra_args)
+        .arg("--")
+        .arg(repo)
+        .env("NIX_SSHOPTS", ssh_opts.join(" "))
+        .stderr(Stdio::inherit());
+    let output = command::Command::new(archive).run::<ArchiveError>().await?;
+    let ArchivedFlake { path } = serde_json::from_slice(&output.stdout)?;
+    let dir = url.split_once('?').and_then(|(_, query)| {
+        query
+            .split('&')
+            .find_map(|param| param.strip_prefix("dir="))
+    });
+    Ok(match dir {
+        Some(dir) => format!("path:{path}?dir={dir}"),
+        None => format!("path:{path}"),
+    })
+}
+
+async fn build_profile_with_remote_eval(
+    data: &PushProfileData,
+    archives: &ArchivedFlakes,
+) -> Result<String, PushProfileError> {
+    let deploy_data = &data.deploy_data;
+    let hostname = deploy_data
+        .cmd_overrides
+        .hostname
+        .as_deref()
+        .unwrap_or(&deploy_data.node.node_settings.hostname);
+    let destination = format!("{}@{}", data.deploy_defs.ssh_user, hostname);
+    let ssh_opts = &deploy_data.merged_settings.ssh_opts;
+    let entry;
+    let repo = if is_local_flake(&data.repo) {
+        let key = (destination.clone(), ssh_opts.clone(), data.repo.clone());
+        entry = archives.0.lock().await.entry(key).or_default().clone();
+        entry
+            .get_or_try_init(|| {
+                archive_flake(&data.repo, &destination, ssh_opts, &data.extra_build_args)
+            })
+            .await?
+    } else {
+        &data.repo
+    };
+    let installable = profile_installable(repo, &deploy_data.node_name, &deploy_data.profile_name);
+    let pb = deploy_data.progressbar.as_ref();
+    run_remote_build(
+        remote_eval_command(
+            &destination,
+            ssh_opts,
+            &installable,
+            &data.extra_build_args,
+            pb.is_some(),
+        ),
+        pb,
+    )
+    .await
+}
+
+fn validate_profile_path(
+    supports_flakes: bool,
+    remote_eval: Option<bool>,
+    remote_build: Option<bool>,
+    path: Option<&str>,
+) -> Result<(), PushProfileError> {
+    if remote_eval == Some(true) {
+        if !supports_flakes {
+            return Err(PushProfileError::RemoteEvalRequiresFlakes);
+        }
+        if remote_build == Some(false) {
+            return Err(PushProfileError::RemoteEvalWithLocalBuild);
+        }
+    } else if path.is_none() {
+        return Err(PushProfileError::MissingProfilePath);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_build_settings(
+    supports_flakes: bool,
+    data: &crate::DeployData,
+) -> Result<(), PushProfileError> {
+    validate_profile_path(
+        supports_flakes,
+        data.merged_settings.remote_eval,
+        data.merged_settings.remote_build,
+        data.profile.profile_settings.path.as_deref(),
+    )
 }
 
 pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfileError> {
-    let profile_settings = &data.deploy_data.profile.profile_settings;
+    build_profile_with_archive_cache(data, &ArchivedFlakes::default()).await
+}
 
+pub(crate) async fn build_profile_with_archive_cache(
+    data: &PushProfileData,
+    archives: &ArchivedFlakes,
+) -> Result<String, PushProfileError> {
+    validate_build_settings(data.supports_flakes, &data.deploy_data)?;
+    if data.deploy_data.merged_settings.remote_eval == Some(true) {
+        return build_profile_with_remote_eval(data, archives).await;
+    }
+
+    let profile_settings = &data.deploy_data.profile.profile_settings;
+    let path = profile_settings
+        .path
+        .as_deref()
+        .ok_or(PushProfileError::MissingProfilePath)?;
     let supports_caret = data.supports_flakes
         || data
             .deploy_data
@@ -628,10 +827,7 @@ pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfile
         debug!("Using drvPath from flake: {}", drv_path);
         deriver_for_build(drv_path.clone(), supports_caret).await?
     } else {
-        debug!(
-            "Finding the deriver of store path for {}",
-            &profile_settings.path
-        );
+        debug!("Finding the deriver of store path for {}", path);
 
         // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
         let mut show_derivation_command = Command::new("nix");
@@ -639,7 +835,7 @@ pub async fn build_profile(data: &PushProfileData) -> Result<String, PushProfile
             .arg("--experimental-features")
             .arg("nix-command")
             .arg("show-derivation")
-            .arg(&profile_settings.path);
+            .arg(path);
         let show_derivation_command_str = format!("{:?}", show_derivation_command);
 
         let show_derivation_output = command::Command::new(show_derivation_command)
@@ -781,11 +977,8 @@ pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), P
 
     // remote building guarantees that the resulting derivation is stored on the target system
     // no need to copy after building
-    if !data
-        .deploy_data
-        .merged_settings
-        .remote_build
-        .unwrap_or(false)
+    if data.deploy_data.merged_settings.remote_eval != Some(true)
+        && data.deploy_data.merged_settings.remote_build != Some(true)
     {
         info!(
             "Copying profile `{}` to node `{}`",
@@ -853,6 +1046,101 @@ pub async fn push_profile(data: &PushProfileData, closure: &str) -> Result<(), P
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn recognizes_local_flakes() {
+        for repo in [
+            ".",
+            "../flake",
+            "/tmp/source",
+            "path:./source",
+            "git+file:///tmp/source",
+            "tarball+file:///tmp/source.tar.gz",
+            "./a:b",
+        ] {
+            assert!(is_local_flake(repo), "{}", repo);
+        }
+        for repo in [
+            "github:owner/repo/sha",
+            "git+https://example.com/repo",
+            "https://example.com/source.tar.gz",
+            "flake:nixpkgs",
+        ] {
+            assert!(!is_local_flake(repo), "{}", repo);
+        }
+    }
+
+    #[test]
+    fn remote_eval_command_preserves_argument_boundaries() {
+        let installable = profile_installable("github:owner/repo/sha", "a.b", "p's $(false)");
+        assert_eq!(
+            installable,
+            "github:owner/repo/sha#deploy.nodes.\"a.b\".profiles.\"p's $(false)\".path"
+        );
+        let command = remote_eval_command(
+            "deploy@target",
+            &["-p".into(), "2222".into()],
+            &installable,
+            &[
+                "--option".into(),
+                "name".into(),
+                "value with '$spaces".into(),
+            ],
+            true,
+        );
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "ssh");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args[..4], ["-p", "2222", "--", "deploy@target"]);
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "set -- {}; printf '%s\\n' \"$@\"",
+                    args[4].to_str().unwrap()
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            [
+                "nix",
+                "build",
+                "--no-link",
+                "--print-out-paths",
+                "--log-format",
+                "internal-json",
+                &installable,
+                "--option",
+                "name",
+                "value with '$spaces"
+            ],
+        );
+    }
+
+    #[test]
+    fn validates_remote_eval_settings() {
+        assert!(validate_profile_path(true, Some(true), None, None).is_ok());
+        assert!(validate_profile_path(true, Some(true), Some(true), None).is_ok());
+        assert!(matches!(
+            validate_profile_path(false, Some(true), None, None),
+            Err(PushProfileError::RemoteEvalRequiresFlakes)
+        ));
+        assert!(matches!(
+            validate_profile_path(true, Some(true), Some(false), None),
+            Err(PushProfileError::RemoteEvalWithLocalBuild)
+        ));
+        assert!(matches!(
+            validate_profile_path(true, Some(false), None, None),
+            Err(PushProfileError::MissingProfilePath)
+        ));
+        assert!(validate_profile_path(false, None, None, Some("/nix/store/path")).is_ok());
+    }
 
     #[test]
     fn parse_build_out_path_returns_single_line() {

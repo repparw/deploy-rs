@@ -153,6 +153,19 @@ in {
     isLocal = false;
     deployArgs = "-s .#server --remote-build -- --offline";
   };
+  remote-eval = mkTest {
+    name = "remote-eval";
+    user = "deploy";
+    isLocal = false;
+    deploySteps = ''
+      server.succeed("touch /etc/deploy-rs-remote-eval")
+      local_output = client.fail("nix eval --impure .#deploy.nodes.remote-eval.profiles.hello-world.path 2>&1")
+      assert "the profile must be evaluated on the target" in local_output, local_output
+      deploy_output = client.succeed("deploy -s .#remote-eval -- --impure --offline 2>&1")
+      assert "Deployment confirmed." in deploy_output, deploy_output
+      server.succeed("su deploy -l -c 'hello | figlet' >&2")
+    '';
+  };
   non-flake-remote-build = mkTest {
     name = "non-flake-remote-build";
     isLocal = false;

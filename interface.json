@@ -31,6 +31,9 @@
                         }
                     ]
                 },
+                "remoteEval": {
+                    "type": ["boolean", "null"]
+                },
                 "fastConnection": {
                     "type": ["boolean", "null"]
                 },

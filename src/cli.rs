@@ -80,6 +80,11 @@ pub struct Opts {
     #[arg(long)]
     remote_build: bool,
 
+    /// Evaluate and build flake profiles on their targets. Use --skip-checks
+    /// if the flake's checks evaluate profile paths on the controller.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    remote_eval: Option<bool>,
+
     /// Override the SSH user with the given value
     #[arg(long)]
     ssh_user: Option<String>,
@@ -215,10 +220,22 @@ pub enum GetDeploymentDataError {
     ProfileNoNode,
 }
 
+fn nix_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace("${", r"\${")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
+}
+
 /// Evaluates the Nix in the given `repo` and return the processed Data from it
 async fn get_deployment_data(
     supports_flakes: bool,
     flakes: &[deploy::DeployFlake<'_>],
+    remote_eval: Option<bool>,
     extra_build_args: &[String],
 ) -> Result<Vec<deploy::data::Data>, GetDeploymentDataError> {
     futures_util::stream::iter(flakes).then(|flake| async move {
@@ -231,12 +248,15 @@ async fn get_deployment_data(
         Command::new("nix-instantiate")
     };
 
-    // Auto-extracts `drvPath` for profiles whose `path` is a derivation, so the
-    // binary can resolve content-addressed and floating-output derivations
-    // whose eval-time `outPath` is a placeholder. The Nix file is a
-    // self-contained function from `deploy` to `deploy`; see
-    // `nix/transform-deploy.nix`.
-    let patch_deploy = include_str!("../nix/transform-deploy.nix");
+    let cli_remote_eval = match remote_eval {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    };
+    let patch_deploy = format!(
+        "({}) {cli_remote_eval}",
+        include_str!("../nix/transform-deploy.nix")
+    );
 
     if supports_flakes {
         eval_command
@@ -254,15 +274,15 @@ async fn get_deployment_data(
                       let patchDeploy = ({2}); in
                       patchDeploy (deploy // {{
                         nodes = {{
-                          "{0}" = deploy.nodes."{0}" // {{
+                          {0} = deploy.nodes.{0} // {{
                             profiles = {{
-                              inherit (deploy.nodes."{0}".profiles) "{1}";
+                              inherit (deploy.nodes.{0}.profiles) {1};
                             }};
                           }};
                         }};
                       }})
                      "#,
-                    node, profile, patch_deploy
+                    nix_string(node), nix_string(profile), patch_deploy
                 ))
             }
             (Some(node), None) => {
@@ -273,11 +293,11 @@ async fn get_deployment_data(
                       let patchDeploy = ({1}); in
                       patchDeploy (deploy // {{
                         nodes = {{
-                          inherit (deploy.nodes) "{0}";
+                          inherit (deploy.nodes) {0};
                         }};
                       }})
                     "#,
-                    node, patch_deploy
+                    nix_string(node), patch_deploy
                 ))
             }
             (None, None) => {
@@ -330,7 +350,7 @@ async fn get_deployment_data(
 struct PromptPart<'a> {
     user: &'a str,
     ssh_user: &'a str,
-    path: &'a str,
+    path: String,
     hostname: &'a str,
     ssh_opts: &'a [String],
 }
@@ -344,14 +364,17 @@ fn print_deployment(
 ) -> Result<(), toml::ser::Error> {
     let mut part_map: HashMap<String, HashMap<String, PromptPart>> = HashMap::new();
 
-    for (_, data, defs) in parts {
+    for (flake, data, defs) in parts {
         let settings = &data.profile.profile_settings;
         // Pre-build, a floating-output profile's `path` is just an opaque
         // placeholder. Show the `.drv` instead so the preview is meaningful.
-        let displayed_path: &str = if settings.path.starts_with("/nix/store/") {
-            &settings.path
-        } else {
-            settings.drv_path.as_deref().unwrap_or(&settings.path)
+        let displayed_path = match settings.path.as_deref() {
+            Some(path) if path.starts_with("/nix/store/") => path.to_owned(),
+            Some(path) => settings.drv_path.as_deref().unwrap_or(path).to_owned(),
+            None => format!(
+                "{} (remote eval)",
+                deploy::push::profile_installable(flake.repo, &data.node_name, &data.profile_name)
+            ),
         };
         part_map
             .entry(data.node_name.to_string())
@@ -633,6 +656,8 @@ async fn run_deploy(
             }
         }
 
+        deploy::push::validate_build_settings(supports_flakes, &deploy_data)
+            .map_err(|e| RunDeployError::BuildProfile(profile_name.into(), node_name.into(), e))?;
         let mut deploy_defs = deploy_data.defs()?;
 
         if deploy_data
@@ -682,6 +707,7 @@ async fn run_deploy(
         print_deployment(&parts[..])?;
     }
 
+    let archived_flakes = deploy::push::ArchivedFlakes::default();
     let data_iter = || {
         parts.iter().map(
             |(deploy_flake, deploy_data, deploy_defs)| deploy::push::PushProfileData {
@@ -698,10 +724,8 @@ async fn run_deploy(
     };
 
     let (remote_builds, local_builds): (Vec<_>, Vec<_>) = data_iter().partition(|data| {
-        data.deploy_data
-            .merged_settings
-            .remote_build
-            .unwrap_or_default()
+        data.deploy_data.merged_settings.remote_eval == Some(true)
+            || data.deploy_data.merged_settings.remote_build == Some(true)
     });
 
     // the grouping by host will retain each hosts ordering by profiles_order since the fold is synchronous
@@ -768,6 +792,7 @@ async fn run_deploy(
                     None
                 };
 
+                let archived_flakes = archived_flakes.clone();
                 set.spawn(async move {
                     let mut built = Vec::new();
                     let mut result = Ok(());
@@ -790,7 +815,12 @@ async fn run_deploy(
                             profilename, nodename
                         );
 
-                        match deploy::push::build_profile(&profile).await {
+                        match deploy::push::build_profile_with_archive_cache(
+                            &profile,
+                            &archived_flakes,
+                        )
+                        .await
+                        {
                             Ok(closure) => built.push((nodename, profilename, closure)),
                             Err(e) => {
                                 result =
@@ -987,6 +1017,8 @@ pub enum RunError {
     PushProfile(#[from] deploy::push::PushProfileError),
     #[error("Failed to test for flake support: {0}")]
     FlakeTest(std::io::Error),
+    #[error("remoteEval requires flakes and cannot be used with --file")]
+    RemoteEvalRequiresFlakes,
     #[error("Failed to check deployment: {0}")]
     CheckDeployment(#[from] CheckDeploymentError),
     #[error("Failed to evaluate deployment data: {0}")]
@@ -1044,6 +1076,7 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         activation_timeout: opts.activation_timeout,
         dry_activate: opts.dry_activate,
         remote_build: opts.remote_build,
+        remote_eval: opts.remote_eval,
         sudo: opts.sudo,
         interactive_sudo: opts.interactive_sudo,
     };
@@ -1063,6 +1096,10 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
 
     let using_flakes = supports_flakes && !do_not_want_flakes;
 
+    if !using_flakes && opts.remote_eval == Some(true) {
+        return Err(RunError::RemoteEvalRequiresFlakes);
+    }
+
     if !opts.skip_checks {
         let mut set = std::collections::HashSet::new();
         deploy_flakes.iter().for_each(|item| {
@@ -1074,7 +1111,13 @@ pub async fn run(args: Option<&ArgMatches>) -> Result<(), RunError> {
         }
     }
     let result_path = opts.result_path.as_deref();
-    let data = get_deployment_data(using_flakes, &deploy_flakes, &opts.extra_build_args).await?;
+    let data = get_deployment_data(
+        using_flakes,
+        &deploy_flakes,
+        opts.remote_eval,
+        &opts.extra_build_args,
+    )
+    .await?;
     run_deploy(
         deploy_flakes,
         data,
